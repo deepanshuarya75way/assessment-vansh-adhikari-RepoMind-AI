@@ -1,0 +1,29 @@
+# Web Frameworks & UI
+streamlit
+fastapi
+uvicorn
+
+# Database & ORM
+sqlalchemy
+asyncpg
+psycopg2-binary
+alembic
+
+# Vector DB & RAG Orchestration
+chromadb
+langchain
+langchain-huggingface
+langchain-chroma
+# AI & Hugging Face
+sentence-transformers
+
+# Code Ingestion & Utils
+GitPython
+tree-sitter
+pydantic
+python-dotenv
+
+
+# Replace or add these dependencies
+groq
+langchain-groq
