@@ -40,6 +40,20 @@ def check_api_health():
         return False
 
 
+def get_or_create_auto_session():
+    """Fetch an automatic UUID session from FastAPI without manual user entry."""
+    try:
+        res = requests.post(f"{API_BASE_URL}/api/v1/sessions/auto", timeout=5)
+        if res.status_code == 200:
+            return res.json().get("session_id")
+    except Exception:
+        pass
+    
+    # Fallback local UUID generation if backend call fails
+    import uuid
+    return str(uuid.uuid4())
+
+
 def ingest_repo(repo_url: str):
     """Trigger repository ingestion via FastAPI."""
     try:
@@ -57,15 +71,16 @@ def ingest_repo(repo_url: str):
 
 def stream_chat_response(session_id: str, query: str):
     """Safely stream AI response from FastAPI with connection keep-alive."""
+    session = requests.Session()
     try:
-        with requests.post(
+        with session.post(
             f"{API_BASE_URL}/api/v1/chat/stream",
             json={"session_id": session_id, "query": query},
             stream=True,
             timeout=(5, 60)  # 5s connect timeout, 60s read timeout
         ) as response:
             if response.status_code == 200:
-                for chunk in response.iter_content(chunk_size=256, decode_unicode=True):
+                for chunk in response.iter_content(chunk_size=512, decode_unicode=True):
                     if chunk:
                         yield chunk
             else:
@@ -76,13 +91,15 @@ def stream_chat_response(session_id: str, query: str):
         yield "❌ **Timeout Error:** Response stream timed out."
     except Exception as e:
         yield f"❌ **Stream Error:** {str(e)}"
+    finally:
+        session.close()
 
 
 # --- App State Initialization ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
-if "session_id" not in st.session_state:
-    st.session_state.session_id = None
+if "session_id" not in st.session_state or not st.session_state.session_id:
+    st.session_state.session_id = get_or_create_auto_session()
 
 
 # --- Sidebar Navigation ---
@@ -153,58 +170,45 @@ if page == "📥 Ingest Repository":
 elif page == "💬 Codebase Chat":
     st.header("💬 Chat with Codebase")
 
-    # Session Configuration Expander
-    with st.expander("⚙️ Chat Session Settings", expanded=st.session_state.session_id is None):
-        session_input = st.text_input(
-            "Chat Session ID (UUID)",
-            value=st.session_state.session_id or "",
-            placeholder="e.g. 123e4567-e89b-12d3-a456-426614174000",
-            help="Paste the ChatSession UUID from your PostgreSQL database."
-        )
-        col_btn1, col_btn2 = st.columns([1, 4])
-        with col_btn1:
-            if st.button("Apply Session"):
-                if session_input.strip():
-                    if st.session_state.session_id != session_input.strip():
-                        st.session_state.session_id = session_input.strip()
-                        st.session_state.messages = []  # Clear memory on session switch
-                        st.success(f"Session set to: `{st.session_state.session_id}`")
-                        st.rerun()
-                else:
-                    st.warning("Please enter a valid Session ID.")
-        with col_btn2:
-            if st.button("Clear Chat Screen"):
-                st.session_state.messages = []
-                st.rerun()
+    # Header Control Bar
+    col_info, col_btn1, col_btn2 = st.columns([3, 1, 1])
+    with col_info:
+        st.caption(f"Session ID: `{st.session_state.session_id}`")
+    with col_btn1:
+        if st.button("🔄 New Thread", use_container_width=True):
+            st.session_state.session_id = get_or_create_auto_session()
+            st.session_state.messages = []
+            st.rerun()
+    with col_btn2:
+        if st.button("🧹 Clear Screen", use_container_width=True):
+            st.session_state.messages = []
+            st.rerun()
 
-    if not st.session_state.session_id:
-        st.info("👆 Please set a Chat Session ID in the expander above to start chatting.")
-    else:
-        st.caption(f"Active Session: `{st.session_state.session_id}`")
+    st.markdown("---")
 
-        # Render Previous Message History
-        for message in st.session_state.messages:
-            with st.chat_message(message["role"]):
-                st.markdown(message["content"])
+    # Render Message History
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
 
-        # User Query Input
-        if query := st.chat_input("Ask anything about the repository code..."):
-            # Display User Message
-            st.session_state.messages.append({"role": "user", "content": query})
-            with st.chat_message("user"):
-                st.markdown(query)
+    # User Direct Query Input
+    if query := st.chat_input("Ask anything about the repository code..."):
+        # Display User Message
+        st.session_state.messages.append({"role": "user", "content": query})
+        with st.chat_message("user"):
+            st.markdown(query)
 
-            # Display Assistant Streamed Message
-            with st.chat_message("assistant"):
-                message_placeholder = st.empty()
-                full_response = ""
+        # Display Assistant Streamed Message
+        with st.chat_message("assistant"):
+            message_placeholder = st.empty()
+            full_response = ""
 
-                # Consume streaming generator from FastAPI endpoint
-                for chunk in stream_chat_response(st.session_state.session_id, query):
-                    full_response += chunk
-                    message_placeholder.markdown(full_response + "▌")
-                
-                message_placeholder.markdown(full_response)
+            # Consume streaming generator from FastAPI endpoint
+            for chunk in stream_chat_response(st.session_state.session_id, query):
+                full_response += chunk
+                message_placeholder.markdown(full_response + "▌")
+            
+            message_placeholder.markdown(full_response)
 
-            # Store response in session state
-            st.session_state.messages.append({"role": "assistant", "content": full_response})
+        # Store response in session state
+        st.session_state.messages.append({"role": "assistant", "content": full_response})

@@ -1,7 +1,9 @@
+import sys
+import uuid
 import asyncio
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, BackgroundTasks, Depends, HTTPException
+from fastapi import FastAPI, BackgroundTasks, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
@@ -13,6 +15,10 @@ from app.model import Repository, ChatSession, ChatMessage
 from app.core.git_service import clone_and_parse_repo
 from app.core.embedding import index_repository_documents
 from app.core.rag import generate_answer_stream
+
+# --- Windows ProactorEventLoop Socket Fix ---
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 
 @asynccontextmanager
@@ -44,6 +50,17 @@ class ChatRequest(BaseModel):
     query: str
 
 
+# --- Helper Functions ---
+async def get_latest_completed_repo(db: AsyncSession) -> Repository | None:
+    """Fetches the most recently processed completed repository."""
+    repo_query = await db.execute(
+        select(Repository)
+        .where(Repository.status == "COMPLETED")
+        .order_by(Repository.id.desc())
+    )
+    return repo_query.scalars().first()
+
+
 # --- Ingestion Background Task ---
 async def process_repository_task(repo_id: str, repo_url: str, db_factory):
     async with db_factory() as db:
@@ -72,6 +89,30 @@ async def process_repository_task(repo_id: str, repo_url: str, db_factory):
 
 
 # --- Endpoints ---
+
+@app.post("/api/v1/sessions/auto")
+async def get_or_create_auto_session(db: AsyncSession = Depends(get_db)):
+    """Creates and returns a valid UUID session automatically bound to the latest completed repo."""
+    latest_repo = await get_latest_completed_repo(db)
+
+    if not latest_repo:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No completed repository found in the database. Please ingest a GitHub repository first."
+        )
+
+    new_session = ChatSession(
+        id=uuid.uuid4(),
+        repo_id=latest_repo.id
+    )
+    
+    db.add(new_session)
+    await db.commit()
+    await db.refresh(new_session)
+    
+    return {"session_id": str(new_session.id), "repo_id": new_session.repo_id}
+
+
 @app.post("/api/v1/repos/ingest")
 async def ingest_repository(
     payload: IngestRequest, 
@@ -111,20 +152,34 @@ async def ingest_repository(
 
 @app.post("/api/v1/chat/stream")
 async def chat_stream(payload: ChatRequest, db: AsyncSession = Depends(get_db)):
-    # Fetch Session & Repo Info
-    result = await db.execute(select(ChatSession).where(ChatSession.id == payload.session_id))
+    # 1. Fetch latest completed repo to ensure we have a valid fallback repo_id
+    latest_repo = await get_latest_completed_repo(db)
+    if not latest_repo:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No completed repository available. Please ingest a repository on the Ingestion page first."
+        )
+
+    # 2. Safely Parse and Validate UUID string
+    try:
+        session_uuid = uuid.UUID(payload.session_id)
+    except (ValueError, AttributeError):
+        session_uuid = uuid.uuid4()
+
+    # 3. Fetch Session & Repo Info
+    result = await db.execute(select(ChatSession).where(ChatSession.id == session_uuid))
     session = result.scalar_one_or_none()
     
     if not session:
-        raise HTTPException(status_code=404, detail="Chat session not found")
+        # Create session entry using latest_repo.id to satisfy PostgreSQL NOT NULL constraint
+        session = ChatSession(id=session_uuid, repo_id=latest_repo.id)
+        db.add(session)
+        await db.commit()
 
     repo_result = await db.execute(select(Repository).where(Repository.id == session.repo_id))
-    repo = repo_result.scalar_one_or_none()
+    repo = repo_result.scalar_one_or_none() or latest_repo
 
-    if not repo:
-        raise HTTPException(status_code=404, detail="Associated repository not found")
-
-    # Get Chat History
+    # 4. Get Chat History
     msg_result = await db.execute(
         select(ChatMessage)
         .where(ChatMessage.session_id == session.id)
@@ -138,23 +193,23 @@ async def chat_stream(payload: ChatRequest, db: AsyncSession = Depends(get_db)):
     db.add(user_msg)
     await db.commit()
 
-    # Thread-safe Stream Response Generator Function
+    # 5. Stream Response Generator Function
     async def event_generator():
         full_response = ""
         loop = asyncio.get_running_loop()
 
         try:
-            # Wrap generator invocation in thread pool executor so it doesn't block the ASGI loop
-            def fetch_stream():
-                return list(generate_answer_stream(payload.query, repo.repo_url, chat_history))
+            # Yield chunks directly as they are generated
+            def get_stream_iterator():
+                return generate_answer_stream(payload.query, repo.repo_url, chat_history)
 
-            chunks = await loop.run_in_executor(None, fetch_stream)
+            stream_iter = await loop.run_in_executor(None, get_stream_iterator)
 
-            for chunk in chunks:
+            for chunk in stream_iter:
                 full_response += chunk
                 yield chunk
                 await asyncio.sleep(0.01)  # Yield control back to event loop for smooth network delivery
-                
+
         except Exception as e:
             err_msg = f"\n[Streaming Error: {str(e)}]\n"
             full_response += err_msg

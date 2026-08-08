@@ -1,9 +1,10 @@
 import os
+import stat
 import shutil
 import tempfile
 from git import Repo
 from langchain_community.document_loaders.parsers import LanguageParser
-from langchain_text_splitters import RecursiveCharacterTextSplitter,Language
+from langchain_text_splitters import RecursiveCharacterTextSplitter, Language
 
 
 SUPPORTED_EXTENSIONS = {
@@ -15,11 +16,11 @@ SUPPORTED_EXTENSIONS = {
     ".java": Language.JAVA,
     ".rs": Language.RUST,
     ".c": Language.CPP,
-    ".go": Language.GO,
     ".php": Language.PHP,
     ".html": Language.HTML,
     ".md": Language.MARKDOWN,
 }
+
 IGNORED_DIRS = {
     ".git",
     ".github",
@@ -35,38 +36,52 @@ IGNORED_DIRS = {
 }
 
 
-def clone_and_parse_repo(repo_url: str):
+def remove_readonly(func, path, exc_info):
+    """Clear the read-only flag on files and directories to fix Windows permission errors during rmtree."""
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
 
-    temp_dir= tempfile.mkdtemp()
+
+def clone_and_parse_repo(repo_url: str):
+    temp_dir = tempfile.mkdtemp()
 
     try:
-        Repo.clone_from(repo_url, temp_dir)
+        # Depth=1 shallow clone to save bandwidth and speed up parsing
+        Repo.clone_from(repo_url, temp_dir, depth=1)
 
         documents = []
         for root, dirs, files in os.walk(temp_dir):
-             dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
-             for file in files:
-                ext = os.path.splitext(file)[1]
+            dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
+            for file in files:
+                ext = os.path.splitext(file)[1].lower()
                 if ext in SUPPORTED_EXTENSIONS:
                     file_path = os.path.join(root, file)
                     rel_path = os.path.relpath(file_path, temp_dir)
-                    
+
                     try:
-                        with open(file_path, "r", encoding="utf-8") as f:
+                        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                             content = f.read()
-                        
-                        splitter= RecursiveCharacterTextSplitter.from_language(
-                            Language= SUPPORTED_EXTENSIONS[ext],
-                            chunk_size= 1000,
-                            chunk_overlap= 200
+
+                        if not content.strip():
+                            continue
+
+                        splitter = RecursiveCharacterTextSplitter.from_language(
+                            language=SUPPORTED_EXTENSIONS[ext],
+                            chunk_size=1000,
+                            chunk_overlap=200,
                         )
-                        chunks= splitter.create_documents(
+                        chunks = splitter.create_documents(
                             texts=[content],
-                            metadatas= [{repo_url: repo_url, "file_path": rel_path}]
+                            metadatas=[{"repo_url": repo_url, "file_path": rel_path}],
                         )
                         documents.extend(chunks)
-                       
-                    except Exception as e:
+
+                    except Exception:
                         continue
+
+        return documents
+
     finally:
-        shutil.rmtree(temp_dir)
+        # Safe cleanup for Windows OS
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, onerror=remove_readonly)
