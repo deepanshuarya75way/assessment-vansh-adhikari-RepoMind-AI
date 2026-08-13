@@ -1,4 +1,5 @@
 import os
+import time
 import requests
 import streamlit as st
 
@@ -40,18 +41,26 @@ def check_api_health():
         return False
 
 
-def get_or_create_auto_session():
-    """Fetch an automatic UUID session from FastAPI without manual user entry."""
+def get_latest_repo():
+    """Fetch the most recently completed repository from the backend."""
+    try:
+        res = requests.get(f"{API_BASE_URL}/api/v1/repos/latest", timeout=5)
+        if res.status_code == 200:
+            return res.json()
+    except Exception:
+        pass
+    return None
+
+
+def create_auto_session():
+    """Fetch an automatic UUID session from FastAPI bound to the latest completed repo."""
     try:
         res = requests.post(f"{API_BASE_URL}/api/v1/sessions/auto", timeout=5)
         if res.status_code == 200:
-            return res.json().get("session_id")
+            return res.json()
     except Exception:
         pass
-    
-    # Fallback local UUID generation if backend call fails
-    import uuid
-    return str(uuid.uuid4())
+    return None
 
 
 def ingest_repo(repo_url: str):
@@ -69,6 +78,17 @@ def ingest_repo(repo_url: str):
         return {"error": str(e)}, 500
 
 
+def fetch_repo_status(repo_id: str):
+    """Fetch ingestion status for a specific repository."""
+    try:
+        res = requests.get(f"{API_BASE_URL}/api/v1/repos/{repo_id}", timeout=5)
+        if res.status_code == 200:
+            return res.json()
+    except Exception:
+        pass
+    return None
+
+
 def stream_chat_response(session_id: str, query: str):
     """Safely stream AI response from FastAPI with connection keep-alive."""
     session = requests.Session()
@@ -77,7 +97,7 @@ def stream_chat_response(session_id: str, query: str):
             f"{API_BASE_URL}/api/v1/chat/stream",
             json={"session_id": session_id, "query": query},
             stream=True,
-            timeout=(5, 60)  # 5s connect timeout, 60s read timeout
+            timeout=(5, 60)
         ) as response:
             if response.status_code == 200:
                 for chunk in response.iter_content(chunk_size=512, decode_unicode=True):
@@ -95,11 +115,67 @@ def stream_chat_response(session_id: str, query: str):
         session.close()
 
 
+def reset_chat_state():
+    """Completely reset the active session state so UI binds to the newest repo."""
+    st.session_state.session_id = None
+    st.session_state.repo_id = None
+    st.session_state.repo_name = None
+    st.session_state.messages = []
+
+
 # --- App State Initialization ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "session_id" not in st.session_state or not st.session_state.session_id:
-    st.session_state.session_id = get_or_create_auto_session()
+    st.session_state.session_id = None
+    st.session_state.repo_id = None
+    st.session_state.repo_name = None
+
+
+def ensure_latest_repo_session():
+    """Ensure the active chat session is bound to the latest completed repo."""
+    # Handle a repo ingested during this UI session
+    pending = st.session_state.get("pending_repo_id")
+    if pending:
+        pending_info = fetch_repo_status(pending)
+        if pending_info:
+            pending_status = pending_info.get("status", "")
+            if pending_status == "COMPLETED":
+                st.session_state.pending_repo_id = None
+                # Force a fresh session so chat binds to the newly ingested repo
+                st.session_state.session_id = None
+                st.session_state.repo_id = None
+                st.session_state.repo_name = None
+                st.session_state.messages = []
+                st.info(f"📦 New repo **{pending_info.get('repo_name')}** is indexed — chat switched to it.")
+            elif pending_status.startswith("FAILED"):
+                st.session_state.pending_repo_id = None
+                st.error(f"❌ Latest ingestion failed: {pending_status}")
+            else:
+                st.warning(f"⏳ New repository `{pending_info.get('repo_name')}` is still processing... Answers below come from the previously indexed repo until it's ready.")
+        else:
+            st.warning("Unable to check ingestion status of the latest repo.")
+
+    latest = get_latest_repo()
+    if not latest:
+        return None, False
+
+    current_repo_id = st.session_state.get("repo_id")
+
+    # If session is already bound to the latest repo, keep it
+    if st.session_state.get("session_id") and current_repo_id == latest["repo_id"]:
+        return latest, False
+
+    # Otherwise fetch new auto session from backend
+    session = create_auto_session()
+    if session and session.get("session_id"):
+        st.session_state.session_id = session["session_id"]
+        st.session_state.repo_id = session.get("repo_id")
+        st.session_state.repo_name = session.get("repo_name", latest.get("repo_name", "Ingested Repo"))
+        st.session_state.messages = []
+        return latest, True
+
+    return latest, False
 
 
 # --- Sidebar Navigation ---
@@ -146,11 +222,41 @@ if page == "📥 Ingest Repository":
                 result, status = ingest_repo(repo_url)
                 
                 if status == 200:
+                    repo_id = result.get("repo_id")
+                    st.session_state.pending_repo_id = repo_id
+
                     st.success("✅ Ingestion Triggered!")
                     st.json(result)
-                    
-                    if "repo_id" in result:
-                        st.info(f"Repository ID: `{result['repo_id']}`")
+
+                    # Poll backend until ingestion completes (or times out)
+                    progress = st.progress(0.0)
+                    status_box = st.empty()
+                    outcome = None
+                    for i in range(20):
+                        time.sleep(5)
+                        info = fetch_repo_status(repo_id) if repo_id else None
+                        if info:
+                            cur_status = info.get("status", "PROCESSING")
+                            status_box.info(f"⏳ Status: `{cur_status}` · files: `{info.get('total_files', '?')}`")
+                            progress.progress(min((i + 1) / 20, 1.0))
+                            if cur_status == "COMPLETED":
+                                outcome = "completed"
+                                break
+                            if cur_status.startswith("FAILED"):
+                                outcome = cur_status
+                                break
+                        else:
+                            status_box.warning("Backend unreachable while polling, retrying...")
+
+                    if outcome == "completed":
+                        st.session_state.pending_repo_id = None
+                        reset_chat_state()
+                        st.success(f"✅ Repository indexed with `{info.get('total_files')}` files. Switch to **💬 Codebase Chat** — it is now bound to this repo.")
+                    elif outcome:
+                        st.session_state.pending_repo_id = None
+                        st.error(f"❌ Ingestion failed: `{outcome}`")
+                    else:
+                        st.info("⏳ Still processing... The **💬 Codebase Chat** page will automatically switch to this repo once it's ready.")
                 else:
                     st.error(f"Failed to submit repository: {result}")
 
@@ -158,9 +264,9 @@ if page == "📥 Ingest Repository":
     st.subheader("💡 How Ingestion Works")
     st.markdown("""
     1. **Clone & Parse:** Clones the repository and strips out binary/non-code files.
-    2. **Chunking:** Segments source code into semantic context blocks using Tree-Sitter.
+    2. **Chunking:** Segments source code into semantic context blocks using Tree-Sitter / Language Parsers.
     3. **Embedding:** Generates vector embeddings using local models / Hugging Face.
-    4. **Storage:** Indexes vectors into ChromaDB for contextual retrieval.
+    4. **Storage:** Indexes vectors into ChromaDB with strict `repo_url` metadata filtering.
     """)
 
 
@@ -170,45 +276,59 @@ if page == "📥 Ingest Repository":
 elif page == "💬 Codebase Chat":
     st.header("💬 Chat with Codebase")
 
-    # Header Control Bar
-    col_info, col_btn1, col_btn2 = st.columns([3, 1, 1])
-    with col_info:
-        st.caption(f"Session ID: `{st.session_state.session_id}`")
-    with col_btn1:
-        if st.button("🔄 New Thread", use_container_width=True):
-            st.session_state.session_id = get_or_create_auto_session()
-            st.session_state.messages = []
-            st.rerun()
-    with col_btn2:
-        if st.button("🧹 Clear Screen", use_container_width=True):
-            st.session_state.messages = []
-            st.rerun()
+    latest_repo, repo_switched = ensure_latest_repo_session()
 
-    st.markdown("---")
+    if not latest_repo:
+        st.warning("No completed repository found yet. Ingest a repository on the **📥 Ingest Repository** page first.")
+    else:
+        if repo_switched:
+            repo_display = st.session_state.get("repo_name") or latest_repo.get("repo_name", "New Repo")
+            st.info(f"📦 Active repository updated — now chatting with **{repo_display}**")
 
-    # Render Message History
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+        # Header Control Bar
+        col_info, col_btn1, col_btn2 = st.columns([3, 1, 1])
+        with col_info:
+            repo_label = st.session_state.get("repo_name") or latest_repo.get("repo_name", "Active Repo")
+            st.caption(f"📦 Repository: `{repo_label}` · Session ID: `{st.session_state.session_id}`")
+        with col_btn1:
+            if st.button("🔄 New Thread", use_container_width=True):
+                session = create_auto_session()
+                if session and session.get("session_id"):
+                    st.session_state.session_id = session["session_id"]
+                    st.session_state.repo_id = session.get("repo_id")
+                    st.session_state.repo_name = session.get("repo_name")
+                st.session_state.messages = []
+                st.rerun()
+        with col_btn2:
+            if st.button("🧹 Clear Screen", use_container_width=True):
+                st.session_state.messages = []
+                st.rerun()
 
-    # User Direct Query Input
-    if query := st.chat_input("Ask anything about the repository code..."):
-        # Display User Message
-        st.session_state.messages.append({"role": "user", "content": query})
-        with st.chat_message("user"):
-            st.markdown(query)
+        st.markdown("---")
 
-        # Display Assistant Streamed Message
-        with st.chat_message("assistant"):
-            message_placeholder = st.empty()
-            full_response = ""
+        # Render Message History
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
 
-            # Consume streaming generator from FastAPI endpoint
-            for chunk in stream_chat_response(st.session_state.session_id, query):
-                full_response += chunk
-                message_placeholder.markdown(full_response + "▌")
-            
-            message_placeholder.markdown(full_response)
+        # User Direct Query Input
+        if query := st.chat_input("Ask anything about the repository code..."):
+            # Display User Message
+            st.session_state.messages.append({"role": "user", "content": query})
+            with st.chat_message("user"):
+                st.markdown(query)
 
-        # Store response in session state
-        st.session_state.messages.append({"role": "assistant", "content": full_response})
+            # Display Assistant Streamed Message
+            with st.chat_message("assistant"):
+                message_placeholder = st.empty()
+                full_response = ""
+
+                # Consume streaming generator from FastAPI endpoint
+                for chunk in stream_chat_response(st.session_state.session_id, query):
+                    full_response += chunk
+                    message_placeholder.markdown(full_response + "▌")
+                
+                message_placeholder.markdown(full_response)
+
+            # Store response in session state
+            st.session_state.messages.append({"role": "assistant", "content": full_response})
