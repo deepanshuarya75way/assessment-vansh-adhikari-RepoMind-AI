@@ -54,7 +54,7 @@ def normalize_repo_url(url: str) -> str:
 
 def get_git_file_operation(repo_path:str, previous_commit:str=):
     repo= Repo(repo_path)
-    addded_files=[]
+    addded_files=set()
     modified_files=[]
     removed_files=[]
 
