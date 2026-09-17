@@ -46,9 +46,9 @@ def index_repository_documents(documents, repo_url: str, report:dict):
     if report["is_incremental"]:
         for deleted_path in report["deleted_paths"]:
             try:
-                vector_store,delete(
+                vector_store.delete(
                     where={
-                        "and":[
+                        "$and":[
                             {"repo_url":clean_url},
                             {"file_path":deleted_path}
                         ]

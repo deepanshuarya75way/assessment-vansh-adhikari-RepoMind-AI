@@ -55,8 +55,8 @@ def normalize_repo_url(url: str) -> str:
 def get_git_file_operation(repo_path:str, previous_commit:str=):
     repo= Repo(repo_path)
     addded_files=set()
-    modified_files=[]
-    removed_files=[]
+    modified_files=set()
+    removed_files=set()
 
     try:
         diff_index= repo.commit(previous_commit).diff("HEAD")
