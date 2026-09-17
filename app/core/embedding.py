@@ -34,7 +34,7 @@ def get_vector_store():
     )
 
 
-def index_repository_documents(documents, repo_url: str):
+def index_repository_documents(documents, repo_url: str, report:dict):
     """Replaces any previously indexed chunks for the same repo, then stores the new code chunks into ChromaDB."""
     clean_url = normalize_repo_url(repo_url)
     raw_url = str(repo_url).strip().rstrip('/')
@@ -42,6 +42,30 @@ def index_repository_documents(documents, repo_url: str):
         raw_url = raw_url[:-4]
 
     vector_store = get_vector_store()
+
+    if report["is_incremental"]:
+        for deleted_path in report["deleted_paths"]:
+            try:
+                vector_store,delete(
+                    where={
+                        "and":[
+                            {"repo_url":clean_url},
+                            {"file_path":deleted_path}
+                        ]
+                    }
+                )
+            except Exception as e:
+                print(f"error pruning {deleted_path}:{e}")
+
+    else:
+        vector_store.delete(where={"repo_url"}=clean_url)
+        return{
+            "status":"success"
+            "is_incremental":report["is_incremental"]
+            "added_files":report["added_count"]
+            "modified_files":report["modified_count"]
+            "deleted_files":report["removed_count"]
+        }
 
     # Delete stale chunks stored under any URL variation of this repo
     for url_form in {clean_url, raw_url}:

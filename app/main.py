@@ -13,7 +13,7 @@ from sqlalchemy.future import select
 
 from app.database import engine, Base, get_db, AsyncSessionLocal
 from app.model import Repository, ChatSession, ChatMessage
-from app.core.git_service import clone_and_parse_repo
+from app.core.git_service import clone_and_parse_repo,clone_and_parse_incremental
 from app.core.embedding import index_repository_documents, get_repo_chunk_count
 from app.core.rag import generate_answer_stream
 
@@ -137,6 +137,25 @@ async def get_or_create_auto_session(db: AsyncSession = Depends(get_db)):
         "repo_name": latest_repo.repo_name,
         "repo_url": latest_repo.repo_url,
     }
+
+
+@app.post("api/v1/refresh")
+async def refresh_repo_index(
+    repo_url: str = Query(...,description= "Target repo url"),
+    force_full: bool = Query(False, description="force full reindex as fallback")):
+        try:
+            report = clone_and_parse_incremental(repo_url=repo_url, force_full=force_full)
+
+            result = index_repository_documents(repo_url= repo_url, report= report)
+            return result
+
+        except Exception as e:
+            raise HTTPException(status_code= 500, detail= f"failed to refresh index:{str(e)}")
+
+
+
+
+
 
 
 @app.get("/api/v1/repos/latest")

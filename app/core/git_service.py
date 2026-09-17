@@ -52,6 +52,40 @@ def normalize_repo_url(url: str) -> str:
     return url.lower()
 
 
+def get_git_file_operation(repo_path:str, previous_commit:str=):
+    repo= Repo(repo_path)
+    addded_files=[]
+    modified_files=[]
+    removed_files=[]
+
+    try:
+        diff_index= repo.commit(previous_commit).diff("HEAD")
+
+        for each_file in diff_index:
+            source_path=each_file.source_path.replace("\\","/") if each_file.source_path else None
+            target_path=each_file.target_path.replace("\\","/") if each_file.target_path else None
+
+            if each_file.new_file:
+                added_files.add(target_path)
+            elif each_file.removed_files:
+                removed_files.add(source_path)
+            elif each_file(source_path)!=each_file(target_path):
+                removed_files.add(source_path)
+                added_files.add(target_path)
+            else:
+                modified_files.add(target_path)
+
+
+        return{
+            "added":list(added_files),
+            "modified":list(modified_files),
+            "removed":list(removed_files)
+        }
+    except Exception as e:
+        print(f"Git diff failed:{e}")
+        return None
+
+
 def extract_repo_info(repo_url: str):
     """Extract owner and repo name from GitHub URL for metadata matching."""
     clean_url = normalize_repo_url(repo_url)
@@ -63,22 +97,8 @@ def extract_repo_info(repo_url: str):
     return clean_url, owner, repo_name
 
 
-def clone_and_parse_repo(repo_url: str):
-    clean_url, owner, repo_name = extract_repo_info(repo_url)
-    original_url = str(repo_url).strip().rstrip('/')
-    temp_dir = tempfile.mkdtemp()
-
-    print(f"[INGEST] Cloning repository: {repo_url}...")
-    print(f"[INGEST] Metadata filters -> clean_repo_url: '{clean_url}' | repo_name: '{repo_name}'")
-
-    try:
-        # Depth=1 shallow clone to save bandwidth and speed up parsing
-        Repo.clone_from(repo_url, temp_dir, depth=1)
-
-        documents = []
-        parsed_files_count = 0
-
-        for root, dirs, files in os.walk(temp_dir):
+def parse_file_to_chunk(file_path:str, rel_path:str, clean_url:str):
+    for root, dirs, files in os.walk(temp_dir):
             dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
             for file in files:
                 ext = os.path.splitext(file)[1].lower()
@@ -131,6 +151,52 @@ def clone_and_parse_repo(repo_url: str):
         print(f"[INGEST ERROR] Failed during repo cloning/parsing: {e}")
         return []
 
+
+
+def clone_and_parse_incremental(repo_url: str, previous_commit:str="HEAD~1"):
+    clean_url, owner, repo_name = extract_repo_info(repo_url)
+    original_url = str(repo_url).strip().rstrip('/')
+    temp_dir = tempfile.mkdtemp()
+
+    print(f"[INGEST] Cloning repository: {repo_url}...")
+    print(f"[INGEST] Metadata filters -> clean_repo_url: '{clean_url}' | repo_name: '{repo_name}'")
+
+    report = {
+        "is_incremental": False,
+        "added_count":0
+        "modified_count":0
+        "removed_count":0
+    }
+
+    try:
+        # Depth=1 shallow clone to save bandwidth and speed up parsing
+        Repo.clone_from(repo_url, temp_dir, depth=1)
+        if diff_changes is not None:
+            report["is_incremental"]= True
+            report["added_counts"]= len(diff_changes["added"])
+            report["modified_count"]= len(diff_changes["modified"])
+            report["removed_count"]= len(diff_changes["removed"])
+
+        documents = []
+        parsed_files_count = 0
+        for rel_path in files_to process:
+            full_path = os.path.join(temp_dir,rel_path)
+            if os.path.exist(full_path):
+                chunks = parse_file_to_chuns(full_path,rel_path,clean_url)
+        report["chunks"]= documents
+
+        else:
+            report["is_incremental"]=False
+            documents= []
+            for root , dirs, files in os.walk(temp_dir):
+                dirs[:]= [d for d in dirs if d is not in IGNORED_DIRS]
+                for file in files:
+                    file_path= os.path.join(root,file)
+                    rel_path= os.path.relpath(file_path, temp_dir).replace("\\", "/")
+                    chunks= parse_file_to_chunk(file_path,rel_path, clean_url)
+                    documents.extend(chunks)
+            report["chunks"]= documents
+       
     finally:
         # Safe cleanup for Windows OS
         if os.path.exists(temp_dir):
