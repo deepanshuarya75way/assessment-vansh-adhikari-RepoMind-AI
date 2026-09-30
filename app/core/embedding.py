@@ -1,5 +1,5 @@
 import logging
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings  # pyright: ignore[reportMissingImports]
 from langchain_chroma import Chroma
 from app.config import settings
 
@@ -105,7 +105,7 @@ def retrieve_code_context(query: str, repo_url: str, k: int = 4):
         unfiltered_results = vector_store.similarity_search(query=query, k=k)
         results = [
             doc for doc in unfiltered_results
-            if normalize_repo_url(doc.metadata.get("repo_url", "")) == clean_url
+            if normalize_repo_url(doc.metadata.get("repo_url", "")) == clean_url  # pyright: ignore[reportUnknownMemberType]
         ]
 
     print(f"[RAG] Found {len(results)} chunks for repo: {clean_url}")

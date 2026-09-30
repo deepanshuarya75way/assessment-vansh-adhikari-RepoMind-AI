@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-from sqlalchemy import String, Integer, DateTime, ForeignKey, Text
+from sqlalchemy import String, Integer, DateTime, ForeignKey, Text, Boolean
 
 # Alias SQLAlchemy's PostgreSQL UUID type to avoid conflicts with Python's uuid.UUID
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
@@ -44,3 +44,12 @@ class ChatMessage(Base):
     timestamp: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
 
     session: Mapped["ChatSession"] = relationship("ChatSession", back_populates="messages")
+
+class AnswerFeedback(Base):
+    __tablename__= "answer_feedback"
+    id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    message_id:Mapped[str] = mapped_column(String, index=True, nullable=False)
+    repo_url: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    user_id:Mapped[int]= mapped_column(String, unique=True, nullable=False)
+    is_positive:Mapped[str]=mapped_column(Boolean, nullable= False)
+

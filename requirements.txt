@@ -13,6 +13,8 @@ alembic
 chromadb
 langchain
 langchain-huggingface
+langchain-text-splitters
+UUID
 langchain-chroma
 # AI & Hugging Face
 sentence-transformers
